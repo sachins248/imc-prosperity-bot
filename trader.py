@@ -49,18 +49,20 @@ class Trader:
             if best_bid is None or best_ask is None: continue
 
             if product == "EMERALDS":
-                fv, risk_factor, edge = 10000.0, 0.06, 1.5 # Provably winning params
+                fv, risk_factor, edge = 10000.0, 0.04, 1.5 # Lowered risk = hold for higher fv return
             else:
                 mid = (best_bid + best_ask) / 2.0
                 wall_mid = self._get_wall_mid(depth)
                 micro = self._get_microprice(depth)
                 vol_bid, vol_ask = depth.buy_orders[best_bid], abs(depth.sell_orders[best_ask])
                 oib = (vol_bid - vol_ask) / (vol_bid + vol_ask)
-                raw_signal = mid + 0.6 * (wall_mid - mid) + 0.7 * (micro - mid) + 0.75 * oib
+                
+                # Boosted OIB weight to 1.2 to anticipate momentum shifts
+                raw_signal = mid + 0.5 * (wall_mid - mid) + 0.6 * (micro - mid) + 1.2 * oib
                 prev_ema = data.get("tomatoes_ema", raw_signal)
-                fv = 0.5 * raw_signal + 0.5 * prev_ema
+                fv = 0.4 * raw_signal + 0.6 * prev_ema
                 data["tomatoes_ema"] = fv
-                risk_factor, edge = 0.10, 1.5 # High-volume aggressive params
+                risk_factor, edge = 0.06, 1.5 # Relaxed holding cost to capture trend meat
 
             res_price = fv - (position * risk_factor)
             product_orders: List[Order] = []
@@ -81,8 +83,11 @@ class Trader:
             # MAKE Phase (Smart Pennying)
             res_price = fv - (position * risk_factor)
             make_bid, make_ask = math.floor(res_price - edge), math.ceil(res_price + edge)
+            
             if best_bid < make_bid: make_bid = min(make_bid, best_bid + 1)
             if best_ask > make_ask: make_ask = max(make_ask, best_ask - 1)
+            
+            # Hard Spread Safety
             make_bid, make_ask = min(make_bid, best_ask - 1), max(make_ask, best_bid + 1)
 
             if buy_cap > 0: product_orders.append(Order(product, make_bid, buy_cap))
