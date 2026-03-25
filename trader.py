@@ -25,7 +25,7 @@ class Trader:
             if product == "EMERALDS":
                 fv = 10000.0
                 
-                # ─── 1. TAKE: Hit orders crossing our FV ───
+                # ─── 1. TAKE: Sweep mispriced orders ───
                 for ask, vol in depth.sell_orders.items():
                     if ask <= fv - 1 and buy_cap > 0:
                         qty = min(-vol, buy_cap)
@@ -40,21 +40,16 @@ class Trader:
                         sell_cap -= qty
                         position -= qty
                         
-                # ─── 2. MAKE: Smart Pennying with Inventory Skew ───
-                skew = (position / 40.0)
-                target_bid = math.floor(fv - 2.0 - skew)
-                target_ask = math.ceil(fv + 2.0 - skew)
+                # ─── 2. MAKE: Strict Target Quoting (No Pennying) ───
+                skew = (position / 40.0) * 1.5 
+                bid_quote = math.floor(fv - 2.0 - skew)
+                ask_quote = math.ceil(fv + 2.0 - skew)
 
-                bid_quote = target_bid
-                if best_bid is not None and best_bid < target_bid:
-                    bid_quote = min(target_bid, best_bid + 1)
-                    
-                ask_quote = target_ask
-                if best_ask is not None and best_ask > target_ask:
-                    ask_quote = max(target_ask, best_ask - 1)
-
-                bid_quote = min(bid_quote, int(fv - 1))
-                ask_quote = max(ask_quote, int(fv + 1))
+                # Hard safety: Never cross the current spread
+                if best_ask is not None:
+                    bid_quote = min(bid_quote, best_ask - 1)
+                if best_bid is not None:
+                    ask_quote = max(ask_quote, best_bid + 1)
 
                 if buy_cap > 0:
                     orders.append(Order(product, bid_quote, buy_cap))
@@ -68,23 +63,13 @@ class Trader:
                     result[product] = []
                     continue
                     
-                # ─── ADVANCED OIB FAIR VALUE ───
+                # ─── The 2512 Smooth Brain ───
                 mid = (best_bid + best_ask) / 2.0
+                prev_ema = data.get("tomatoes_ema", mid)
                 
-                wall_bid = max(depth.buy_orders.items(), key=lambda level: level[1])[0]
-                wall_ask = min(depth.sell_orders.items(), key=lambda level: abs(level[1]))[0]
-                wall_mid = (wall_bid + wall_ask) / 2.0
-                
-                bid_vol = depth.buy_orders[best_bid]
-                ask_vol = abs(depth.sell_orders[best_ask])
-                microprice = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
-                oib = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-                
-                raw_signal = mid + 0.7 * (wall_mid - mid) + 0.8 * (microprice - mid) + 0.75 * oib
-                
-                prev_ema = data.get("tomatoes_ema", raw_signal)
-                fv = 0.45 * raw_signal + 0.55 * prev_ema
-                data["tomatoes_ema"] = fv
+                ema = 0.45 * mid + 0.55 * prev_ema
+                data["tomatoes_ema"] = ema
+                fv = ema
                 
                 # ─── 1. TAKE ───
                 for ask, vol in depth.sell_orders.items():
@@ -101,25 +86,21 @@ class Trader:
                         sell_cap -= qty
                         position -= qty
                         
-                # ─── 2. MAKE ───
-                skew = (position / 40.0) * 1.5 
-                target_bid = math.floor(fv - 2.0 - skew)
-                target_ask = math.ceil(fv + 2.0 - skew)
+                # ─── 2. MAKE: Strict Quoting + Aggressive Eject Skew ───
+                # Increased skew slightly to act as a stronger eject button since we are taking more volume
+                skew = (position / 40.0) * 2.0 
+                bid_quote = math.floor(fv - 2.0 - skew)
+                ask_quote = math.ceil(fv + 2.0 - skew)
 
-                bid_quote = target_bid
-                if best_bid is not None and best_bid < target_bid:
-                    bid_quote = min(target_bid, best_bid + 1)
-                    
-                ask_quote = target_ask
-                if best_ask is not None and best_ask > target_ask:
-                    ask_quote = max(target_ask, best_ask - 1)
+                # Hard safety: Never cross the current spread
+                if best_ask is not None:
+                    bid_quote = min(bid_quote, best_ask - 1)
+                if best_bid is not None:
+                    ask_quote = max(ask_quote, best_bid + 1)
 
-                bid_quote = min(bid_quote, math.floor(fv - 1))
-                ask_quote = max(ask_quote, math.ceil(fv + 1))
-
-                # Safe sizing to avoid over-committing on heavy skew
-                safe_buy = min(buy_cap, max(0, limit - position))
-                safe_sell = min(sell_cap, max(0, limit + position))
+                # Cap max passive order size slightly so we don't get 80-lot dumped on in a single tick
+                safe_buy = min(buy_cap, 40)
+                safe_sell = min(sell_cap, 40)
 
                 if safe_buy > 0:
                     orders.append(Order(product, bid_quote, safe_buy))
