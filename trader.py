@@ -162,14 +162,20 @@ class Trader:
         return orders, remaining_buy, remaining_sell, expected_position
 
     def _quote_prices(self, best_bid: int, best_ask: int, adjusted_fair: float, quote_edge: float) -> Tuple[int, int]:
-        # Penny the top of the book, but never price worse than our required edge
-        bid_quote = min(best_bid + 1, math.floor(adjusted_fair - quote_edge))
-        ask_quote = max(best_ask - 1, math.ceil(adjusted_fair + quote_edge))
+        # Quote exactly at our required edge from fair value
+        bid_quote = math.floor(adjusted_fair - quote_edge)
+        ask_quote = math.ceil(adjusted_fair + quote_edge)
 
-        # Prevent crossed quotes or 0 spread
+        # Safety: Never quote worse than the current book (don't get buried)
+        # and never accidentally cross the spread (which would trigger a taker fee/bad fill)
+        if best_bid is not None:
+            bid_quote = max(bid_quote, best_bid)
+        if best_ask is not None:
+            ask_quote = min(ask_quote, best_ask)
+
+        # Final sanity check: ensure quotes don't cross each other
         if bid_quote >= ask_quote:
-            bid_quote = min(best_bid, ask_quote - 1)
-            ask_quote = max(best_ask, bid_quote + 1)
+            bid_quote = ask_quote - 1
 
         return bid_quote, ask_quote
 
