@@ -49,7 +49,8 @@ class Trader:
             if best_bid is None or best_ask is None: continue
 
             if product == "EMERALDS":
-                fv, risk_factor, edge = 10000.0, 0.02, 1.5 # Ultra-low risk for Emeralds
+                fv, risk_factor, base_edge = 10000.0, 0.04, 1.5
+                edge = base_edge
             else:
                 mid = (best_bid + best_ask) / 2.0
                 wall_mid = self._get_wall_mid(depth)
@@ -57,17 +58,22 @@ class Trader:
                 vol_bid, vol_ask = depth.buy_orders[best_bid], abs(depth.sell_orders[best_ask])
                 oib = (vol_bid - vol_ask) / (vol_bid + vol_ask)
                 
-                # Snappier signal (Alpha 0.8) and high OIB conviction
-                raw_signal = mid + 0.4 * (wall_mid - mid) + 0.5 * (micro - mid) + 1.8 * oib
+                # Sharpened OIB weight
+                raw_signal = mid + 0.4 * (wall_mid - mid) + 0.6 * (micro - mid) + 1.5 * oib
                 prev_ema = data.get("tomatoes_ema", raw_signal)
-                fv = 0.8 * raw_signal + 0.2 * prev_ema
+                
+                # Reactive Alpha (0.6): Faster tracking of momentum shifts
+                fv = 0.6 * raw_signal + 0.4 * prev_ema
                 data["tomatoes_ema"] = fv
-                risk_factor, edge = 0.03, 1.5 # Loosened risk to ride trends
+                risk_factor = 0.04 # Match Emeralds risk for max inventory utilization
+                
+                # DYNAMIC EDGE: Narrow edge when conviction (OIB) is high to secure fills
+                edge = 1.0 if abs(oib) > 0.6 else 1.5
 
             res_price = fv - (position * risk_factor)
             product_orders: List[Order] = []
             
-            # 1. TAKE Phase (The Sniper)
+            # TAKE Phase (Aggressive Sniping)
             t_bid, t_ask = math.floor(res_price - edge), math.ceil(res_price + edge)
             for ask_price, vol in sorted(depth.sell_orders.items()):
                 if ask_price <= t_bid and buy_cap > 0:
@@ -80,35 +86,20 @@ class Trader:
                     product_orders.append(Order(product, bid_price, -qty))
                     sell_cap -= qty; position -= qty
 
-            # 2. MAKE Phase (The Ladder)
-            # Split remaining capacity into two levels: Competitive and Greedy
-            if buy_cap > 0:
-                comp_buy_qty = buy_cap // 2
-                greedy_buy_qty = buy_cap - comp_buy_qty
-                
-                comp_bid = min(math.floor(res_price - edge), best_bid + 1)
-                greedy_bid = comp_bid - 1 # One tick deeper for big sweeps
-                
-                product_orders.append(Order(product, int(comp_bid), int(comp_buy_qty)))
-                if greedy_buy_qty > 0:
-                    product_orders.append(Order(product, int(greedy_bid), int(greedy_buy_qty)))
+            # MAKE Phase (Ultra Queue Priority)
+            res_price = fv - (position * risk_factor)
+            make_bid, make_ask = math.floor(res_price - edge), math.ceil(res_price + edge)
+            
+            # Penny the top of the book but stay within mathematical reservation boundary
+            if best_bid < make_bid: make_bid = min(make_bid, best_bid + 1)
+            if best_ask > make_ask: make_ask = max(make_ask, best_ask - 1)
+            
+            # Hard Spread Safety
+            make_bid, make_ask = min(make_bid, best_ask - 1), max(make_ask, best_bid + 1)
 
-            if sell_cap > 0:
-                comp_sell_qty = sell_cap // 2
-                greedy_sell_qty = sell_cap - comp_sell_qty
-                
-                comp_ask = max(math.ceil(res_price + edge), best_ask - 1)
-                greedy_ask = comp_ask + 1
-                
-                product_orders.append(Order(product, int(comp_ask), int(-comp_sell_qty)))
-                if greedy_sell_qty > 0:
-                    product_orders.append(Order(product, int(greedy_ask), int(-greedy_sell_qty)))
-
+            if buy_cap > 0: product_orders.append(Order(product, make_bid, buy_cap))
+            if sell_cap > 0: product_orders.append(Order(product, make_ask, -sell_cap))
             result[product] = product_orders
-
-        # 3. Final Flatten (Safety Valve)
-        if state.timestamp > 990000: # Last 1% of the day
-            risk_factor = 0.5 # Aggressively dump inventory to close at zero
 
         trader_data = json.dumps(data)
         logger.flush(state, result, 0, trader_data)
