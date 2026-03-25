@@ -31,7 +31,7 @@ class Trader:
                         qty = min(-vol, buy_cap)
                         orders.append(Order(product, ask, qty))
                         buy_cap -= qty
-                        position += qty # Update position for accurate skewing
+                        position += qty
                 
                 for bid, vol in depth.buy_orders.items():
                     if bid >= fv + 1 and sell_cap > 0:
@@ -41,7 +41,7 @@ class Trader:
                         position -= qty
                         
                 # ─── 2. MAKE: Smart Pennying with Inventory Skew ───
-                skew = (position / 40.0) # Skews quotes up to 2 ticks based on inventory
+                skew = (position / 40.0)
                 target_bid = math.floor(fv - 2.0 - skew)
                 target_ask = math.ceil(fv + 2.0 - skew)
 
@@ -53,7 +53,6 @@ class Trader:
                 if best_ask is not None and best_ask > target_ask:
                     ask_quote = max(target_ask, best_ask - 1)
 
-                # Hard safety: Never quote at or worse than fair value
                 bid_quote = min(bid_quote, int(fv - 1))
                 ask_quote = max(ask_quote, int(fv + 1))
 
@@ -69,13 +68,23 @@ class Trader:
                     result[product] = []
                     continue
                     
+                # ─── ADVANCED OIB FAIR VALUE ───
                 mid = (best_bid + best_ask) / 2.0
-                prev_ema = data.get("tomatoes_ema", mid)
                 
-                # Fast EMA to track the trending asset without lagging
-                ema = 0.45 * mid + 0.55 * prev_ema
-                data["tomatoes_ema"] = ema
-                fv = ema
+                wall_bid = max(depth.buy_orders.items(), key=lambda level: level[1])[0]
+                wall_ask = min(depth.sell_orders.items(), key=lambda level: abs(level[1]))[0]
+                wall_mid = (wall_bid + wall_ask) / 2.0
+                
+                bid_vol = depth.buy_orders[best_bid]
+                ask_vol = abs(depth.sell_orders[best_ask])
+                microprice = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
+                oib = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+                
+                raw_signal = mid + 0.7 * (wall_mid - mid) + 0.8 * (microprice - mid) + 0.75 * oib
+                
+                prev_ema = data.get("tomatoes_ema", raw_signal)
+                fv = 0.45 * raw_signal + 0.55 * prev_ema
+                data["tomatoes_ema"] = fv
                 
                 # ─── 1. TAKE ───
                 for ask, vol in depth.sell_orders.items():
@@ -93,7 +102,7 @@ class Trader:
                         position -= qty
                         
                 # ─── 2. MAKE ───
-                skew = (position / 40.0) * 1.5 # Skews up to 3 ticks
+                skew = (position / 40.0) * 1.5 
                 target_bid = math.floor(fv - 2.0 - skew)
                 target_ask = math.ceil(fv + 2.0 - skew)
 
@@ -108,10 +117,14 @@ class Trader:
                 bid_quote = min(bid_quote, math.floor(fv - 1))
                 ask_quote = max(ask_quote, math.ceil(fv + 1))
 
-                if buy_cap > 0:
-                    orders.append(Order(product, bid_quote, buy_cap))
-                if sell_cap > 0:
-                    orders.append(Order(product, ask_quote, -sell_cap))
+                # Safe sizing to avoid over-committing on heavy skew
+                safe_buy = min(buy_cap, max(0, limit - position))
+                safe_sell = min(sell_cap, max(0, limit + position))
+
+                if safe_buy > 0:
+                    orders.append(Order(product, bid_quote, safe_buy))
+                if safe_sell > 0:
+                    orders.append(Order(product, ask_quote, -safe_sell))
 
                 result[product] = orders
 
