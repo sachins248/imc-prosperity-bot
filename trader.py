@@ -1,27 +1,25 @@
 import json
 import math
 from typing import Dict, List, Tuple
-
 from datamodel import Order, OrderDepth, TradingState
-
 
 LIMITS = {"EMERALDS": 80, "TOMATOES": 80}
 
+# ─── EMERALDS PARAMS ──────────────────────────────────────────────────────────
 EMERALDS_FAIR_VALUE = 10000.0
-EMERALDS_QUOTE_EDGE = 3.0
+EMERALDS_QUOTE_EDGE = 1.5
 EMERALDS_TAKE_EDGE = 1.0
-EMERALDS_POSITION_SKEW = 0.10
-EMERALDS_PASSIVE_SIZE = 20
+EMERALDS_POSITION_SKEW = 0.08
 
-TOMATO_ALPHA = 0.35
-TOMATO_QUOTE_EDGE = 2.0
+# ─── TOMATOES PARAMS ──────────────────────────────────────────────────────────
+TOMATO_ALPHA = 0.45
+TOMATO_QUOTE_EDGE = 1.5
 TOMATO_TAKE_EDGE = 1.0
 TOMATO_POSITION_SKEW = 0.12
-TOMATO_PASSIVE_SIZE = 12
 
-SOFT_POSITION_LIMIT = 50
-HARD_POSITION_LIMIT = 65
-
+# ─── UNIVERSAL PARAMS ─────────────────────────────────────────────────────────
+# Stop quoting into the direction of our inventory when near the limit
+SOFT_POSITION_LIMIT = 76
 
 class Trader:
     def run(self, state: TradingState):
@@ -43,13 +41,11 @@ class Trader:
                 quote_edge = EMERALDS_QUOTE_EDGE
                 take_edge = EMERALDS_TAKE_EDGE
                 position_skew = EMERALDS_POSITION_SKEW
-                passive_size = EMERALDS_PASSIVE_SIZE
             else:
                 fair_value = self._update_tomato_fair_value(depth, data)
                 quote_edge = TOMATO_QUOTE_EDGE
                 take_edge = TOMATO_TAKE_EDGE
                 position_skew = TOMATO_POSITION_SKEW
-                passive_size = TOMATO_PASSIVE_SIZE
 
             best_bid, best_ask = self._best_prices(depth)
             if best_bid is None or best_ask is None:
@@ -59,10 +55,14 @@ class Trader:
             remaining_buy = LIMITS[product] - position
             remaining_sell = LIMITS[product] + position
 
+            # --- OPTIMIZATION 1: Skew fair value BEFORE taking stale quotes ---
+            # Prevents us from aggressively taking liquidity when our inventory is already heavy
+            taking_fair = fair_value - (position_skew * position)
+
             take_orders, remaining_buy, remaining_sell, expected_position = self._take_stale_quotes(
                 product=product,
                 depth=depth,
-                fair_value=fair_value,
+                fair_value=taking_fair,
                 take_edge=take_edge,
                 position=position,
                 remaining_buy=remaining_buy,
@@ -70,30 +70,24 @@ class Trader:
             )
             orders.extend(take_orders)
 
-            clear_orders, remaining_buy, remaining_sell, expected_position = self._inventory_clear(
-                product=product,
-                position=expected_position,
-                best_bid=best_bid,
-                best_ask=best_ask,
-                remaining_buy=remaining_buy,
-                remaining_sell=remaining_sell,
-            )
-            orders.extend(clear_orders)
-
-            adjusted_fair = fair_value - position_skew * expected_position
+            # --- OPTIMIZATION 2: Re-skew quoting fair value based on expected position ---
+            quoting_fair = fair_value - (position_skew * expected_position)
             bid_quote, ask_quote = self._quote_prices(
                 best_bid=best_bid,
                 best_ask=best_ask,
-                adjusted_fair=adjusted_fair,
+                adjusted_fair=quoting_fair,
                 quote_edge=quote_edge,
             )
 
-            passive_buy_size = min(passive_size, max(0, remaining_buy))
-            passive_sell_size = min(passive_size, max(0, remaining_sell))
+            # --- OPTIMIZATION 3: Maximize passive volume sizes ---
+            # We quote our entire remaining capacity instead of artificially limiting to 12/20 lots
+            passive_buy_size = max(0, remaining_buy)
+            passive_sell_size = max(0, remaining_sell)
 
-            if position > SOFT_POSITION_LIMIT:
+            # Safety valve: Stop providing liquidity in the direction of heavy inventory
+            if expected_position > SOFT_POSITION_LIMIT:
                 passive_buy_size = 0
-            elif position < -SOFT_POSITION_LIMIT:
+            elif expected_position < -SOFT_POSITION_LIMIT:
                 passive_sell_size = 0
 
             if passive_buy_size > 0:
@@ -107,30 +101,39 @@ class Trader:
         return result, 0, trader_data
 
     def _update_tomato_fair_value(self, depth: OrderDepth, data: dict) -> float:
-        best_bid, best_ask = self._best_prices(depth)
-        wall_mid = self._wall_mid(depth)
-        microprice = self._microprice(depth)
-        mid = (best_bid + best_ask) / 2.0
+        """
+        Calculates TOMATOES fair value using Wall Midpoint and Order Imbalance (OIB).
+        This prevents getting run over by short-term micro-trends compared to just microprice.
+        """
+        wall_bid = max(depth.buy_orders.items(), key=lambda level: level[1])[0]
+        wall_ask = min(depth.sell_orders.items(), key=lambda level: abs(level[1]))[0]
+        wall_mid = (wall_bid + wall_ask) / 2.0
 
-        raw_signal = mid + 0.8 * (wall_mid - mid) + 0.9 * (microprice - mid)
+        best_bid = max(depth.buy_orders)
+        best_ask = min(depth.sell_orders)
+        vol_bid = depth.buy_orders[best_bid]
+        vol_ask = abs(depth.sell_orders[best_ask])
+        
+        # OIB ranges from -1 to 1 based on buy vs sell pressure
+        oib = (vol_bid - vol_ask) / (vol_bid + vol_ask)
+        
+        # Blend the wall mid with the order book pressure
+        raw_signal = wall_mid + (oib * 1.5)
+        
         previous = data.get("tomatoes_ema")
         fair_value = raw_signal if previous is None else TOMATO_ALPHA * raw_signal + (1.0 - TOMATO_ALPHA) * previous
         data["tomatoes_ema"] = fair_value
+        
         return fair_value
 
     def _take_stale_quotes(
-        self,
-        product: str,
-        depth: OrderDepth,
-        fair_value: float,
-        take_edge: float,
-        position: int,
-        remaining_buy: int,
-        remaining_sell: int,
+        self, product: str, depth: OrderDepth, fair_value: float, take_edge: float, 
+        position: int, remaining_buy: int, remaining_sell: int
     ) -> Tuple[List[Order], int, int, int]:
         orders: List[Order] = []
         expected_position = position
 
+        # Take cheap asks
         for ask_price in sorted(depth.sell_orders):
             if remaining_buy <= 0:
                 break
@@ -143,6 +146,7 @@ class Trader:
                 remaining_buy -= quantity
                 expected_position += quantity
 
+        # Hit rich bids
         for bid_price in sorted(depth.buy_orders, reverse=True):
             if remaining_sell <= 0:
                 break
@@ -157,37 +161,12 @@ class Trader:
 
         return orders, remaining_buy, remaining_sell, expected_position
 
-    def _inventory_clear(
-        self,
-        product: str,
-        position: int,
-        best_bid: int,
-        best_ask: int,
-        remaining_buy: int,
-        remaining_sell: int,
-    ) -> Tuple[List[Order], int, int, int]:
-        orders: List[Order] = []
-        expected_position = position
-
-        if position > HARD_POSITION_LIMIT and remaining_sell > 0:
-            quantity = min(position - SOFT_POSITION_LIMIT, remaining_sell)
-            if quantity > 0:
-                orders.append(Order(product, best_bid, -quantity))
-                remaining_sell -= quantity
-                expected_position -= quantity
-        elif position < -HARD_POSITION_LIMIT and remaining_buy > 0:
-            quantity = min((-position) - SOFT_POSITION_LIMIT, remaining_buy)
-            if quantity > 0:
-                orders.append(Order(product, best_ask, quantity))
-                remaining_buy -= quantity
-                expected_position += quantity
-
-        return orders, remaining_buy, remaining_sell, expected_position
-
     def _quote_prices(self, best_bid: int, best_ask: int, adjusted_fair: float, quote_edge: float) -> Tuple[int, int]:
+        # Penny the top of the book, but never price worse than our required edge
         bid_quote = min(best_bid + 1, math.floor(adjusted_fair - quote_edge))
         ask_quote = max(best_ask - 1, math.ceil(adjusted_fair + quote_edge))
 
+        # Prevent crossed quotes or 0 spread
         if bid_quote >= ask_quote:
             bid_quote = min(best_bid, ask_quote - 1)
             ask_quote = max(best_ask, bid_quote + 1)
@@ -198,15 +177,3 @@ class Trader:
         best_bid = max(depth.buy_orders) if depth.buy_orders else None
         best_ask = min(depth.sell_orders) if depth.sell_orders else None
         return best_bid, best_ask
-
-    def _wall_mid(self, depth: OrderDepth) -> float:
-        wall_bid = max(depth.buy_orders.items(), key=lambda level: level[1])[0]
-        wall_ask = min(depth.sell_orders.items(), key=lambda level: abs(level[1]))[0]
-        return (wall_bid + wall_ask) / 2.0
-
-    def _microprice(self, depth: OrderDepth) -> float:
-        best_bid = max(depth.buy_orders)
-        best_ask = min(depth.sell_orders)
-        bid_volume = depth.buy_orders[best_bid]
-        ask_volume = abs(depth.sell_orders[best_ask])
-        return (best_bid * ask_volume + best_ask * bid_volume) / (bid_volume + ask_volume)
